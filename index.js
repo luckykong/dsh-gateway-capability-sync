@@ -31,15 +31,14 @@
  *     enriched right after Harness applies it;
  *   - the `/gateway-sync` chat command, for a manual run with a report.
  *
- * A JSON report of the last run is written to `sync-debug.json` next to this
- * file when `debug` is enabled.
+ * Reports are written under the Harness home when `debug` is enabled.
  */
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const VERSION = '1.0.3'
+const { version: VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
 const PACKAGE_DIR = dirname(fileURLToPath(import.meta.url))
 
 /**
@@ -65,10 +64,10 @@ function resolveReportDir() {
   }
 }
 
-const REPORT_DIR = resolveReportDir()
 const LOADER_ENTRY_NAME = '@deepseek-ai/dsh-llm-pi-ai'
 const THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const THINKING_LEVEL_SET = new Set(THINKING_LEVELS)
+const THINKING_FORMATS = new Set(['openai', 'deepseek', 'openrouter', 'together', 'baseten', 'zai', 'qwen', 'chat-template', 'qwen-chat-template', 'string-thinking', 'ant-ling'])
 const STARTUP_DELAY_MS = 4000
 const RELOAD_DEBOUNCE_MS = 1500
 const RETRY_DELAY_MS = 8000
@@ -135,19 +134,21 @@ function normalizeConfig(raw) {
   const providers = Array.isArray(input.providers)
     ? input.providers.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => item.trim())
     : []
+  const thinkingFormat = text(input.thinkingFormat) || DEFAULTS.thinkingFormat
+  if (!THINKING_FORMATS.has(thinkingFormat)) throw new Error('unsupported thinkingFormat: ' + thinkingFormat)
   return {
     entryId: text(input.entryId) || DEFAULTS.entryId,
-    providers,
+    providers: [...new Set(providers)],
     syncOnStart: input.syncOnStart !== false,
     syncOnConfigReload: input.syncOnConfigReload !== false,
     syncImages: input.syncImages !== false,
     syncReasoning: input.syncReasoning !== false,
-    thinkingFormat: text(input.thinkingFormat) || DEFAULTS.thinkingFormat,
+    thinkingFormat,
     overwrite: input.overwrite === 'always' ? 'always' : DEFAULTS.overwrite,
     debug: input.debug !== false,
     debugFile: text(input.debugFile) || DEFAULTS.debugFile,
     requestTimeoutMs: Number.isFinite(input.requestTimeoutMs)
-      ? Math.max(1000, Math.round(input.requestTimeoutMs))
+      ? Math.min(2147483647, Math.max(1000, Math.round(input.requestTimeoutMs)))
       : DEFAULTS.requestTimeoutMs,
   }
 }
@@ -172,14 +173,18 @@ function readListing(payload) {
         .map((level) => text(level))
         .filter((level) => level !== '' && level !== 'off' && THINKING_LEVEL_SET.has(level))
       : []
+    const defaultEffort = text(raw.reasoning_default_effort) || text(raw.reasoning_effort)
+    const inferredReasoning = efforts.length > 0 || (defaultEffort !== 'off' && THINKING_LEVEL_SET.has(defaultEffort))
     rows.push({
       id,
       name: text(raw.name) || text(raw.display_name) || id,
-      supportsImages: raw.supports_images === true,
-      supportsReasoning: raw.supports_reasoning === true,
+      supportsImages: typeof raw.supports_images === 'boolean' ? raw.supports_images : undefined,
+      supportsReasoning: typeof raw.supports_reasoning === 'boolean'
+        ? raw.supports_reasoning
+        : inferredReasoning ? true : undefined,
       efforts,
-      defaultEffort: text(raw.reasoning_default_effort) || text(raw.reasoning_effort),
-      canDisableThinking: raw.can_disable_thinking === true,
+      defaultEffort,
+      canDisableThinking: typeof raw.can_disable_thinking === 'boolean' ? raw.can_disable_thinking : undefined,
       contextWindow: numberOrUndefined(raw.context_length) ?? numberOrUndefined(raw.contextWindow) ?? numberOrUndefined(raw.max_allowed_size),
       maxTokens: numberOrUndefined(raw.max_output_tokens) ?? numberOrUndefined(raw.maxTokens),
     })
@@ -187,15 +192,15 @@ function readListing(payload) {
   return rows
 }
 
-/** The pi-ai `reasoningEfforts` dict a gateway row supports, or null. */
+/** False is an explicit denial; undefined means no usable declaration. */
 function deriveReasoningEfforts(row) {
-  if (!row.supportsReasoning) return null
+  if (row.supportsReasoning === false) return false
   const levels = []
   for (const level of row.efforts) if (!levels.includes(level)) levels.push(level)
   if (levels.length === 0 && row.defaultEffort !== '' && row.defaultEffort !== 'off' && THINKING_LEVEL_SET.has(row.defaultEffort)) {
     levels.push(row.defaultEffort)
   }
-  if (levels.length === 0) return null
+  if (levels.length === 0) return undefined
   levels.sort((left, right) => THINKING_LEVELS.indexOf(left) - THINKING_LEVELS.indexOf(right))
   const efforts = {}
   for (const level of levels) efforts[level] = level
@@ -207,14 +212,15 @@ function deriveReasoningEfforts(row) {
  * Enrich one configured model from its gateway row.
  * @returns {{ model: object, changed: boolean, applied: string[] }}
  */
-function enrichModel(model, row, config) {
+function enrichModel(model, row, config, provider) {
   if (!isObject(model) || row === undefined || row === null) return { model, changed: false, applied: [] }
   const next = cloneJson(model)
   const applied = []
   const always = config.overwrite === 'always'
 
-  if (config.syncImages) {
-    const hasInput = Array.isArray(next.input) && next.input.length > 0
+  if (config.syncImages && row.supportsImages !== undefined) {
+    const hasInput = (Array.isArray(next.input) && next.input.length > 0)
+      || (Array.isArray(provider.defaultInput) && provider.defaultInput.length > 0)
     if (always || !hasInput) {
       const desired = row.supportsImages ? ['text', 'image'] : ['text']
       if (!deepEqual(next.input, desired)) {
@@ -227,24 +233,30 @@ function enrichModel(model, row, config) {
   if (config.syncReasoning) {
     const efforts = deriveReasoningEfforts(row)
     const hasEfforts = next.reasoningEfforts !== undefined
-    if (always || !hasEfforts) {
-      if (efforts !== null) {
-        next.reasoningEfforts = efforts
-        applied.push('reasoningEfforts')
-        const compat = isObject(next.compat) ? { ...next.compat } : {}
-        if (compat.thinkingFormat === undefined) {
-          compat.thinkingFormat = config.thinkingFormat
-          applied.push('compat.thinkingFormat')
-        }
-        if (compat.supportsReasoningEffort === undefined) {
-          compat.supportsReasoningEffort = true
-          applied.push('compat.supportsReasoningEffort')
-        }
-        next.compat = compat
-      } else if (always && hasEfforts) {
-        next.reasoningEfforts = false
-        applied.push('reasoningEfforts=false')
+    if ((always || !hasEfforts) && efforts !== undefined) {
+      // An omitted off capability does not revoke an existing declaration.
+      if (isObject(efforts) && row.canDisableThinking === undefined
+        && isObject(next.reasoningEfforts) && Object.hasOwn(next.reasoningEfforts, 'off')) {
+        efforts.off = next.reasoningEfforts.off
       }
+      if (!deepEqual(next.reasoningEfforts, efforts)) {
+        next.reasoningEfforts = efforts
+        applied.push(efforts === false ? 'reasoningEfforts=false' : 'reasoningEfforts')
+      }
+    }
+    // These two switches are only valid for Chat Completions. Unknown catalog
+    // protocols are deliberately left alone rather than guessed from a URL.
+    if (row.supportsReasoning === true && provider.api === 'openai-completions' && isObject(next.reasoningEfforts)) {
+      const compat = isObject(next.compat) ? { ...next.compat } : {}
+      const inheritedCompat = isObject(provider.compat) ? provider.compat : {}
+      for (const [field, value] of Object.entries({ thinkingFormat: config.thinkingFormat, supportsReasoningEffort: true })) {
+        const effective = compat[field] === undefined ? inheritedCompat[field] : compat[field]
+        if ((always || effective === undefined) && !deepEqual(effective, value)) {
+          compat[field] = value
+          applied.push('compat.' + field)
+        }
+      }
+      if (Object.keys(compat).length > 0) next.compat = compat
     }
   }
 
@@ -253,13 +265,17 @@ function enrichModel(model, row, config) {
 
 /** Apply one gateway's capability table to a whole provider config. */
 function enrichProviderConfig(providerConfig, gateway, config) {
-  const stats = { models: 0, enriched: 0, images: 0, reasoning: 0, canDisableThinking: 0, fields: {} }
-  if (!isObject(providerConfig) || !Array.isArray(providerConfig.models)) return stats
+  const stats = { models: 0, matched: 0, enriched: 0, images: 0, reasoning: 0, canDisableThinking: 0, fields: {}, warnings: [] }
+  if (!isObject(providerConfig) || !Array.isArray(providerConfig.models) || providerConfig.models.length === 0) {
+    stats.skipped = 'no configured models list; catalog-only routes are not modified'
+    return stats
+  }
   const nextModels = providerConfig.models.map((model) => {
     stats.models += 1
     const id = isObject(model) ? text(model.id) : ''
     const row = id === '' ? undefined : gateway.byId.get(id)
-    const { model: enriched, changed, applied } = enrichModel(model, row, config)
+    if (row !== undefined) stats.matched += 1
+    const { model: enriched, changed, applied } = enrichModel(model, row, config, providerConfig)
     if (changed) {
       stats.enriched += 1
       for (const field of applied) stats.fields[field] = (stats.fields[field] || 0) + 1
@@ -272,49 +288,57 @@ function enrichProviderConfig(providerConfig, gateway, config) {
     return enriched
   })
   providerConfig.models = nextModels
+  if (stats.matched === 0) stats.skipped = 'no configured model matched the gateway listing'
+  if (config.syncReasoning && !text(providerConfig.api)
+    && nextModels.some((model) => isObject(model) && isObject(model.reasoningEfforts))) {
+    stats.warnings.push('api is not explicit; completions-only compat was left untouched')
+  }
   return stats
 }
 
 /** Resolve the provider entry to edit from the live configuration. */
 function findEntry(configuration, config) {
-  const wanted = config.entryId
-  for (const layer of configuration) {
-    const entry = layer.entry
-    if (!isObject(entry)) continue
-    const id = text(entry.id)
-    const name = isObject(entry.options) ? text(entry.options.name) : ''
-    if (id === wanted || (name === LOADER_ENTRY_NAME && id !== '')) return layer
+  const matches = configuration.filter((layer) => entryIdOf(layer.entry) === config.entryId)
+  if (matches.length > 1) throw new Error('multiple Loader entries have id "' + config.entryId + '"')
+  if (matches.length === 1) {
+    if (matches[0].entry.options?.name !== LOADER_ENTRY_NAME) throw new Error('entry "' + config.entryId + '" is not ' + LOADER_ENTRY_NAME)
+    return matches[0]
   }
-  // Fall back to the package name when the row id was customized.
-  for (const layer of configuration) {
-    const entry = layer.entry
-    if (isObject(entry) && isObject(entry.options) && text(entry.options.name) === LOADER_ENTRY_NAME) return layer
-  }
-  return undefined
+  if (config.entryId !== DEFAULTS.entryId) return undefined
+  const candidates = configuration.filter((layer) => layer.entry?.options?.name === LOADER_ENTRY_NAME)
+  if (candidates.length > 1) throw new Error('multiple pi-ai Loader entries found; set entryId explicitly')
+  return candidates[0]
 }
 
-function providerConfigOf(override, inherited, providerKey) {
-  const fromOverride = isObject(override) && isObject(override.providers) && isObject(override.providers[providerKey])
-    ? override.providers[providerKey]
-    : undefined
-  const fromInherited = isObject(inherited) && isObject(inherited.providers) && isObject(inherited.providers[providerKey])
-    ? inherited.providers[providerKey]
-    : undefined
-  if (fromOverride === undefined && fromInherited === undefined) return undefined
-  return { ...(fromInherited || {}), ...(fromOverride || {}) }
+function entryIdOf(entry) {
+  return text(entry?.options?.id) || text(entry?.id)
 }
 
-function selectProviderKeys(override, inherited, config) {
+// ConfigEditor persists complete raw configs, not a deep-merge patch. The live
+// entry is authoritative even when its explicit config is empty.
+function configurationOf(layer) {
+  if (isObject(layer.entry?.options) && Object.hasOwn(layer.entry.options, 'config')) {
+    return isObject(layer.entry.options.config) ? layer.entry.options.config : {}
+  }
+  if (isObject(layer.override) && Object.keys(layer.override).length > 0) return layer.override
+  return isObject(layer.inherited) ? layer.inherited : {}
+}
+
+function providerConfigOf(current, providerKey) {
+  return isObject(current.providers) && Object.hasOwn(current.providers, providerKey)
+    && isObject(current.providers[providerKey]) ? current.providers[providerKey] : undefined
+}
+
+function selectProviderKeys(current, config) {
   if (config.providers.length > 0) return config.providers
-  const keys = new Set()
-  for (const source of [inherited, override]) {
-    if (!isObject(source) || !isObject(source.providers)) continue
-    for (const key of Object.keys(source.providers)) {
-      const provider = providerConfigOf(override, inherited, key)
-      if (provider !== undefined && text(provider.baseURL) !== '') keys.add(key)
-    }
-  }
-  return [...keys]
+  return Object.keys(isObject(current.providers) ? current.providers : {})
+    .filter((key) => text(providerConfigOf(current, key)?.baseURL) !== '')
+}
+
+function gatewaySource(provider) {
+  return Object.fromEntries(['baseURL', 'apiKeyEnv', 'headers', 'api']
+    .filter((field) => provider[field] !== undefined)
+    .map((field) => [field, provider[field]]))
 }
 
 /**
@@ -324,61 +348,63 @@ function selectProviderKeys(override, inherited, config) {
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig)
-  const debugFile = config.debugFile !== '' ? config.debugFile : join(REPORT_DIR, 'sync-debug.json')
+  const reportDir = config.debug && config.debugFile === '' ? resolveReportDir() : ''
+  const debugFile = config.debugFile !== '' ? config.debugFile : join(reportDir, 'sync-debug.json')
+  const capabilityFile = config.debugFile === '' ? join(reportDir, 'sync-capabilities.json')
+    : debugFile.endsWith('.json') ? debugFile.slice(0, -5) + '-capabilities.json' : debugFile + '.capabilities.json'
   const hmr = ctx.get('hmr')
   // The plugin is activated inside an HMR transaction, and Node timers inherit
   // that AsyncLocalStorage scope. Running our work through hmr.executing.exit
   // drops the inherited scope so configEditor.edit (which needs its own HMR
   // transaction) does not fail with "HMR transactions cannot be nested".
   function outsideHmr(operation) {
-    try {
-      if (hmr !== undefined && hmr.executing !== undefined && typeof hmr.executing.exit === 'function') {
-        return hmr.executing.exit(operation)
-      }
-    } catch (error) {
-      console.warn('[gateway-capability-sync] could not leave the HMR transaction context:', error)
+    if (hmr !== undefined && hmr.executing !== undefined && typeof hmr.executing.exit === 'function') {
+      return hmr.executing.exit(operation)
     }
     return operation()
   }
 
   let inFlight = undefined
+  let pendingReason = undefined
   let debounceTimer = undefined
   let retryTimer = undefined
   let retriesLeft = MAX_RETRIES
   let scanTimer = undefined
   let disposed = false
+  const lifecycle = new AbortController()
 
   function writeDebug(report) {
-    if (!config.debug) return
-    const target = report.kind === 'capability-scan' && config.debugFile === ''
-      ? join(REPORT_DIR, 'sync-capabilities.json')
-      : debugFile
+    if (!config.debug || disposed) return
+    const target = report.kind === 'capability-scan' ? capabilityFile : debugFile
     try {
+      mkdirSync(dirname(target), { recursive: true })
       writeFileSync(target, JSON.stringify(report, null, 2) + '\n', 'utf8')
     } catch (error) {
       console.warn('[gateway-capability-sync] could not write debug report:', error)
     }
   }
 
-  async function readGateway(providerKey, provider) {
+  async function readGateway(provider) {
     const baseURL = text(provider.baseURL)
     if (baseURL === '') return { error: 'provider has no baseURL' }
     const url = baseURL.replace(/\/+$/, '') + '/models'
-    const headers = { accept: 'application/json' }
+    const headers = new Headers({ accept: 'application/json' })
     if (isObject(provider.headers)) {
       for (const [name, value] of Object.entries(provider.headers)) {
-        if (typeof value === 'string') headers[name] = value
+        if (typeof value === 'string') headers.set(name, value)
       }
     }
     const apiKeyEnv = text(provider.apiKeyEnv)
     if (apiKeyEnv !== '') {
       const resolved = await ctx.credentials.resolve(apiKeyEnv)
+      lifecycle.signal.throwIfAborted()
       if (resolved === undefined) return { error: 'credential ' + apiKeyEnv + ' is not configured' }
-      headers.authorization = 'Bearer ' + resolved.value
+      headers.set('authorization', 'Bearer ' + resolved.value)
     }
+    lifecycle.signal.throwIfAborted()
     const response = await fetch(url, {
       headers,
-      signal: AbortSignal.timeout(config.requestTimeoutMs),
+      signal: AbortSignal.any([lifecycle.signal, AbortSignal.timeout(config.requestTimeoutMs)]),
     })
     if (!response.ok) {
       return { error: 'HTTP ' + response.status + ' from ' + url }
@@ -389,17 +415,24 @@ export function apply(ctx, rawConfig) {
     return { rows }
   }
 
-  function transform(override, inherited, gateways) {
-    const next = cloneJson(isObject(override) ? override : {})
-    const providers = isObject(next.providers) ? next.providers : undefined
-    const statsByProvider = {}
-    if (providers === undefined) return { next, statsByProvider }
+  function transform(current, gateways) {
+    const next = cloneJson(isObject(current) ? current : {})
+    const statsByProvider = Object.create(null)
+    let stale = false
     for (const [providerKey, gateway] of Object.entries(gateways)) {
-      const provider = providers[providerKey]
-      if (!isObject(provider) || !Array.isArray(provider.models)) continue
+      const provider = providerConfigOf(next, providerKey)
+      if (provider === undefined) {
+        statsByProvider[providerKey] = { skipped: 'provider was removed before the sync completed' }
+        continue
+      }
+      if (!deepEqual(gatewaySource(provider), gateway.source)) {
+        statsByProvider[providerKey] = { skipped: 'provider connection changed; stale listing was discarded' }
+        stale = true
+        continue
+      }
       statsByProvider[providerKey] = enrichProviderConfig(provider, gateway, config)
     }
-    return { next, statsByProvider }
+    return { next, statsByProvider, stale }
   }
 
   function scheduleRetry(reason, error) {
@@ -411,110 +444,163 @@ export function apply(ctx, rawConfig) {
     retryTimer = setTimeout(() => {
       retryTimer = undefined
       console.warn('[gateway-capability-sync] retrying ' + reason + ' sync after an HMR transaction ends')
-      runSync(reason + '-retry').catch((failure) => console.warn('[gateway-capability-sync] retry failed:', failure))
+      outsideHmr(() => runSync(reason + '-retry')).catch((failure) => console.warn('[gateway-capability-sync] retry failed:', failure))
     }, RETRY_DELAY_MS)
   }
 
-  async function runSync(reason) {
-    if (disposed) return undefined
-    if (inFlight !== undefined) return inFlight
-    inFlight = (async () => {
-      const startedAt = Date.now()
-      const report = {
-        version: VERSION,
-        reason,
-        at: new Date().toISOString(),
-        entryId: config.entryId,
-        overwrite: config.overwrite,
-        options: {
-          providers: config.providers,
-          syncImages: config.syncImages,
-          syncReasoning: config.syncReasoning,
-          thinkingFormat: config.thinkingFormat,
-        },
-        providers: [],
-        stats: {},
-        wrote: false,
-        errors: [],
-        durationMs: 0,
+  async function syncOnce(reason) {
+    const startedAt = Date.now()
+    const report = {
+      version: VERSION,
+      reason,
+      at: new Date().toISOString(),
+      entryId: config.entryId,
+      overwrite: config.overwrite,
+      options: {
+        providers: config.providers,
+        syncImages: config.syncImages,
+        syncReasoning: config.syncReasoning,
+        thinkingFormat: config.thinkingFormat,
+      },
+      providers: [],
+      stats: {},
+      wrote: false,
+      status: 'failed',
+      errors: [],
+      durationMs: 0,
+    }
+    try {
+      const configuration = ctx.configEditor.configuration()
+      const layer = findEntry(configuration, config)
+      if (layer === undefined) {
+        report.errors.push('loader entry "' + config.entryId + '" (' + LOADER_ENTRY_NAME + ') was not found')
+        report.availableEntryIds = configuration.map((item) => {
+          const entry = item.entry
+          return isObject(entry) ? entryIdOf(entry) + ' → ' + (isObject(entry.options) ? text(entry.options.name) : '') : ''
+        })
+        return report
       }
-      try {
-        const configuration = ctx.configEditor.configuration()
-        const layer = findEntry(configuration, config)
-        if (layer === undefined) {
-          report.errors.push('loader entry "' + config.entryId + '" (' + LOADER_ENTRY_NAME + ') was not found')
-          report.availableEntryIds = configuration.map((item) => {
-            const entry = item.entry
-            return isObject(entry) ? text(entry.id) + ' → ' + (isObject(entry.options) ? text(entry.options.name) : '') : ''
-          })
-          return report
-        }
-        report.entry = {
-          id: isObject(layer.entry) ? text(layer.entry.id) : '',
-          name: isObject(layer.entry) && isObject(layer.entry.options) ? text(layer.entry.options.name) : '',
-        }
-        const override = isObject(layer.override) ? layer.override : {}
-        const inherited = isObject(layer.inherited) ? layer.inherited : {}
-        const providerKeys = selectProviderKeys(override, inherited, config)
-        if (providerKeys.length === 0) {
-          report.errors.push('no provider with a baseURL is configured on ' + report.entry.name)
-          return report
-        }
+      report.entry = {
+        id: entryIdOf(layer.entry),
+        name: isObject(layer.entry) && isObject(layer.entry.options) ? text(layer.entry.options.name) : '',
+      }
+      const current = cloneJson(configurationOf(layer))
+      const providerKeys = selectProviderKeys(current, config)
+      if (providerKeys.length === 0) {
+        report.errors.push('no provider with a baseURL is configured on ' + report.entry.name)
+        return report
+      }
 
-        const gateways = {}
-        for (const providerKey of providerKeys) {
-          const provider = providerConfigOf(override, inherited, providerKey)
-          if (provider === undefined) {
-            report.providers.push({ key: providerKey, error: 'provider is not configured' })
-            continue
-          }
-          const accepted = await readGateway(providerKey, provider)
-          if (accepted.error !== undefined) {
-            report.providers.push({ key: providerKey, baseURL: text(provider.baseURL), error: accepted.error })
-            continue
-          }
-          const byId = new Map()
-          for (const row of accepted.rows) byId.set(row.id, row)
-          gateways[providerKey] = { byId }
-          report.providers.push({
-            key: providerKey,
-            baseURL: text(provider.baseURL),
-            models: accepted.rows.length,
-            withImages: accepted.rows.filter((row) => row.supportsImages).length,
-            withReasoning: accepted.rows.filter((row) => row.supportsReasoning).length,
-            withOff: accepted.rows.filter((row) => row.canDisableThinking).length,
-          })
+      const gateways = Object.create(null)
+      for (const providerKey of providerKeys) {
+        lifecycle.signal.throwIfAborted()
+        const provider = providerConfigOf(current, providerKey)
+        if (provider === undefined) {
+          report.providers.push({ key: providerKey, error: 'provider is not configured' })
+          continue
         }
-
-        if (Object.keys(gateways).length === 0) {
-          report.errors.push('no provider could be interrogated; config left untouched')
-          return report
-        }
-
-        const preview = transform(override, inherited, gateways)
-        report.stats = preview.statsByProvider
-        if (deepEqual(preview.next, override)) {
-          report.wrote = false
-          return report
-        }
-
-        const entry = layer.entry
+        let accepted
         try {
-          await ctx.configEditor.edit(entry, (current) => {
-            const edited = transform(isObject(current) ? current : {}, inherited, gateways)
-            return edited.next
-          })
-          report.wrote = true
+          accepted = await readGateway(provider)
         } catch (error) {
-          report.errors.push(error instanceof Error ? error.message : String(error))
-          scheduleRetry(reason, error)
+          lifecycle.signal.throwIfAborted()
+          accepted = { error: error instanceof Error ? error.message : String(error) }
+        }
+        lifecycle.signal.throwIfAborted()
+        if (accepted.error !== undefined) {
+          report.providers.push({ key: providerKey, baseURL: text(provider.baseURL), error: accepted.error })
+          continue
+        }
+        const byId = new Map()
+        for (const row of accepted.rows) byId.set(row.id, row)
+        gateways[providerKey] = { byId, source: cloneJson(gatewaySource(provider)) }
+        report.providers.push({
+          key: providerKey,
+          baseURL: text(provider.baseURL),
+          models: accepted.rows.length,
+          withImages: accepted.rows.filter((row) => row.supportsImages).length,
+          withReasoning: accepted.rows.filter((row) => row.supportsReasoning).length,
+          withOff: accepted.rows.filter((row) => row.canDisableThinking).length,
+        })
+      }
+
+      if (Object.keys(gateways).length === 0) {
+        report.errors.push('no provider could be interrogated; config left untouched')
+        return report
+      }
+
+      lifecycle.signal.throwIfAborted()
+      const preview = transform(current, gateways)
+      report.stats = preview.statsByProvider
+      report.status = 'up-to-date'
+      if (deepEqual(preview.next, current)) {
+        if (Object.values(report.stats).every((stats) => stats.skipped !== undefined)) report.status = 'skipped'
+        return report
+      }
+
+      const entry = layer.entry
+      try {
+        await ctx.configEditor.edit(entry, (latest) => {
+          lifecycle.signal.throwIfAborted()
+          const edited = transform(latest, gateways)
+          report.stats = edited.statsByProvider
+          if (edited.stale) pendingReason = 'config-changed'
+          report.wrote = !deepEqual(edited.next, latest)
+          return edited.next
+        })
+        report.status = report.wrote ? 'updated' : 'skipped'
+        retriesLeft = MAX_RETRIES
+        if (retryTimer !== undefined) {
+          clearTimeout(retryTimer)
+          retryTimer = undefined
         }
       } catch (error) {
+        report.wrote = false
+        report.status = disposed ? 'cancelled' : 'failed'
+        if (disposed) return report
         report.errors.push(error instanceof Error ? error.message : String(error))
-      } finally {
-        report.durationMs = Date.now() - startedAt
-        writeDebug(report)
+        scheduleRetry(reason, error)
       }
+    } catch (error) {
+      if (disposed) report.status = 'cancelled'
+      else {
+        report.status = 'failed'
+        report.errors.push(error instanceof Error ? error.message : String(error))
+      }
+    } finally {
+      if (report.status !== 'cancelled' && (report.errors.length > 0 || report.providers.some((provider) => provider.error !== undefined))) {
+        report.status = report.wrote ? 'partial' : 'failed'
+      }
+      report.durationMs = Date.now() - startedAt
+      writeDebug(report)
+    }
+    return report
+  }
+
+  function runSync(reason) {
+    if (disposed) return Promise.resolve(undefined)
+    if (inFlight !== undefined) {
+      if (reason === 'config-reload' || reason.endsWith('-retry')) pendingReason = reason
+      return inFlight
+    }
+    inFlight = (async () => {
+      const previousRuns = []
+      let nextReason = reason
+      let wrote = false
+      let report
+      do {
+        pendingReason = undefined
+        report = await syncOnce(nextReason)
+        wrote ||= report.wrote
+        // A reload queued while fetching needs a fresh pass before verification.
+        if (!disposed && pendingReason === undefined && config.debug) await scanCapabilities()
+        nextReason = pendingReason
+        if (nextReason !== undefined) previousRuns.push({ reason: report.reason, wrote: report.wrote, errors: report.errors, stats: report.stats })
+      } while (!disposed && nextReason !== undefined)
+      if (wrote && report.status === 'up-to-date') report.status = 'updated'
+      report.wrote = wrote
+      report.previousRuns = previousRuns
+      writeDebug(report)
       return report
     })().finally(() => {
       inFlight = undefined
@@ -530,54 +616,59 @@ export function apply(ctx, rawConfig) {
       models: [],
       errors: [],
     }
-    const llm = ctx.get('llm')
-    if (llm === undefined || typeof llm.listModels !== 'function') {
-      report.errors.push('llm service is not available')
-      return report
-    }
-    let providerIds = []
     try {
-      const info = llm.listProviders()
-      providerIds = Array.isArray(info) ? info.map((item) => text(item && item.id)).filter((id) => id !== '') : []
-    } catch (error) {
-      report.errors.push('listProviders failed: ' + (error instanceof Error ? error.message : String(error)))
-      return report
-    }
-    for (const provider of providerIds) {
-      try {
-        const models = await llm.listModels(provider)
-        for (const model of models) {
-          const resolved = await llm.resolveModelInfo(provider, model.id)
-          const efforts = resolved.reasoning && Array.isArray(resolved.reasoning.efforts)
-            ? resolved.reasoning.efforts.map((effort) => text(effort && effort.id)).filter((id) => id !== '')
-            : []
-          report.models.push({
-            provider,
-            model: model.id,
-            inputModalities: Array.isArray(resolved.inputModalities) ? [...resolved.inputModalities] : [],
-            efforts,
-            defaultEffort: resolved.reasoning && resolved.reasoning.defaultEffort !== undefined ? String(resolved.reasoning.defaultEffort) : undefined,
-            contextWindow: resolved.context ? resolved.context.contextWindow : undefined,
-            defaultMaxTokens: resolved.defaultMaxTokens,
-          })
-        }
-        report.providers.push({ provider, models: models.length })
-      } catch (error) {
-        report.errors.push(provider + ': ' + (error instanceof Error ? error.message : String(error)))
+      lifecycle.signal.throwIfAborted()
+      const llm = ctx.get('llm')
+      if (llm === undefined || typeof llm.listModels !== 'function' || typeof llm.listProviders !== 'function'
+        || typeof llm.resolveModelInfo !== 'function') {
+        report.errors.push('llm service is not available')
+        return report
       }
+      const info = await llm.listProviders()
+      const providerIds = Array.isArray(info) ? info.map((item) => text(item && item.id)).filter((id) => id !== '') : []
+      for (const provider of providerIds) {
+        try {
+          lifecycle.signal.throwIfAborted()
+          const models = await llm.listModels(provider)
+          for (const model of models) {
+            lifecycle.signal.throwIfAborted()
+            const resolved = await llm.resolveModelInfo(provider, model.id)
+            lifecycle.signal.throwIfAborted()
+            const efforts = resolved.reasoning && Array.isArray(resolved.reasoning.efforts)
+              ? resolved.reasoning.efforts.map((effort) => text(effort && effort.id)).filter((id) => id !== '')
+              : []
+            report.models.push({
+              provider,
+              model: model.id,
+              inputModalities: Array.isArray(resolved.inputModalities) ? [...resolved.inputModalities] : [],
+              efforts,
+              defaultEffort: resolved.reasoning && resolved.reasoning.defaultEffort !== undefined ? String(resolved.reasoning.defaultEffort) : undefined,
+              contextWindow: resolved.context ? resolved.context.contextWindow : undefined,
+              defaultMaxTokens: resolved.defaultMaxTokens,
+            })
+          }
+          report.providers.push({ provider, models: models.length })
+        } catch (error) {
+          if (disposed) return report
+          report.errors.push(provider + ': ' + (error instanceof Error ? error.message : String(error)))
+        }
+      }
+    } catch (error) {
+      if (!disposed) report.errors.push(error instanceof Error ? error.message : String(error))
+    } finally {
+      report.summary = {
+        models: report.models.length,
+        withImage: report.models.filter((model) => model.inputModalities.includes('image')).length,
+        withReasoning: report.models.filter((model) => model.efforts.length > 0).length,
+        withOff: report.models.filter((model) => model.efforts.includes('off')).length,
+      }
+      writeDebug({ ...report, kind: 'capability-scan' })
     }
-    report.summary = {
-      models: report.models.length,
-      withImage: report.models.filter((model) => model.inputModalities.includes('image')).length,
-      withReasoning: report.models.filter((model) => model.efforts.length > 0).length,
-      withOff: report.models.filter((model) => model.efforts.includes('off')).length,
-    }
-    writeDebug({ ...report, kind: 'capability-scan' })
     return report
   }
 
   function formatReport(report) {
-    if (report === undefined) return 'gateway sync is already running; try again in a moment'
+    if (report === undefined) return 'gateway sync cancelled: plugin is inactive'
     const lines = []
     const providerText = report.providers
       .map((provider) => provider.error !== undefined
@@ -588,11 +679,17 @@ export function apply(ctx, rawConfig) {
     const stats = report.stats || {}
     for (const [key, value] of Object.entries(stats)) {
       const fields = Object.entries(value.fields || {}).map(([field, count]) => field + '×' + count).join(', ')
-      lines.push(key + ': ' + value.enriched + '/' + value.models + ' models enriched' + (fields === '' ? '' : ' (' + fields + ')'))
+      lines.push(value.skipped !== undefined ? key + ': skipped: ' + value.skipped
+        : key + ': ' + value.enriched + '/' + value.models + ' models enriched' + (fields === '' ? '' : ' (' + fields + ')'))
+      for (const warning of value.warnings || []) lines.push(key + ': warning: ' + warning)
     }
-    lines.push(report.wrote ? 'config updated and reloaded' : 'config already up to date')
+    const failed = report.status === 'failed' || report.status === 'partial'
+    lines.push(report.status === 'cancelled' ? 'gateway sync cancelled: plugin is inactive'
+      : report.wrote ? 'config updated and reloaded' + (failed ? ' (some providers failed)' : '')
+        : report.status === 'skipped' ? 'config left unchanged: sync skipped'
+          : failed ? 'config left unchanged: sync failed' : 'config already up to date')
     if (report.errors.length > 0) lines.push('errors: ' + report.errors.join(' | '))
-    lines.push('report: ' + debugFile)
+    if (config.debug) lines.push('report: ' + debugFile)
     return lines.join('\n')
   }
 
@@ -614,6 +711,11 @@ export function apply(ctx, rawConfig) {
   if (config.syncOnConfigReload) {
     ctx.effect(() => {
       const off = ctx.on('app-boot/config-reload', () => {
+        if (disposed) return
+        if (inFlight !== undefined) {
+          pendingReason = 'config-reload'
+          return
+        }
         if (debounceTimer !== undefined) clearTimeout(debounceTimer)
         debounceTimer = setTimeout(() => {
           debounceTimer = undefined
@@ -640,26 +742,27 @@ export function apply(ctx, rawConfig) {
       description: 'Sync model capabilities (vision / reasoning levels) from the configured OpenAI-compatible gateway.',
       handler: async () => {
         const report = await outsideHmr(() => runSync('command'))
-        const failed = report === undefined || report.errors.length > 0 || (report.providers || []).some((provider) => provider.error !== undefined)
+        const failed = report === undefined || ['failed', 'partial', 'cancelled'].includes(report.status)
         return { kind: failed ? 'error' : 'success', text: formatReport(report) }
       },
     }), 'gateway-capability-sync: command')
   }
 
-  // Post-sync scan: read the capabilities the running adapter actually serves.
-  // Written to sync-capabilities.json so the effect of a sync can be checked
-  // without opening the UI.
+  // With startup sync disabled, keep one initial diagnostic scan. Every sync
+  // otherwise scans only after edits and any queued reloads have completed.
   const timerService = ctx.timer
-  if (timerService !== undefined && typeof timerService.timeout === 'function') {
+  if (config.debug && !config.syncOnStart && timerService !== undefined && typeof timerService.timeout === 'function') {
     scanTimer = timerService.timeout(() => {
-      outsideHmr(() => {
-        scanCapabilities().catch((error) => console.warn('[gateway-capability-sync] capability scan failed:', error))
-      })
+      if (!disposed && inFlight === undefined) outsideHmr(() => scanCapabilities())
+        .catch((error) => console.warn('[gateway-capability-sync] capability scan failed:', error))
     }, SCAN_DELAY_MS)
   }
 
   ctx.effect(() => () => {
     disposed = true
+    pendingReason = undefined
+    lifecycle.abort()
+    if (debounceTimer !== undefined) clearTimeout(debounceTimer)
     if (retryTimer !== undefined) clearTimeout(retryTimer)
     if (scanTimer !== undefined && typeof scanTimer === 'function') scanTimer()
   }, 'gateway-capability-sync: disposed flag')

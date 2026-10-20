@@ -1,7 +1,14 @@
 {
   "name": "dsh-gateway-capability-sync",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check index.js && node --test"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
   "description": "Reads vision / reasoning-effort / thinking-disable capabilities from an OpenAI-compatible gateway's /v1/models and writes them into the Harness pi-ai provider config.",
   "keywords": [
     "dsh",
@@ -29,7 +36,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "docs/*.md"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=0.2.1-0 <0.3.0"
