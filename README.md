@@ -118,6 +118,21 @@ npm run check
 
 ## 版本记录
 
+### 1.1.1
+
+修复同步状态判定错误，并明确 HMR 事务失败的恢复行为：
+
+- **误报失败**：配置无需改动（能力已齐全）、但另有 provider 连不上时，整轮被标为 `failed`。
+  现在只有真正尝试写入却失败才算 `failed`；写入了部分 provider 记 `partial`；无需写入时保持
+  `up-to-date`。这会影响 `/gateway-sync` 的返回：能力已齐全且某个网关离线时不再报错。
+- **HMR 事务冲突**：`configEditor.edit` 遇到 `HMR transactions cannot be nested` 时，现在明确交给
+  节流重试处理（8 秒后重跑），而不是当作永久失败；写入成功后重试预算重新恢复，
+  避免早先偶发失败耗尽预算连累后续同步。
+- 报告不再输出内部的 `attemptedWrite` 字段。
+
+排查提示：`sync-debug.json` 中 `status` 与 `wrote` 需结合看——
+`up-to-date` + `wrote:false` 表示无需改动，`partial` + `wrote:true` 表示部分网关更新成功。
+
 ### 1.1.0
 
 修复 14 项已确认缺陷（GCS-01 至 GCS-14），主要包括：

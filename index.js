@@ -74,6 +74,11 @@ const RETRY_DELAY_MS = 8000
 const SCAN_DELAY_MS = 9000
 const MAX_RETRIES = 6
 
+/** True for the Host's rejection of an edit issued inside a transaction. */
+function isNestedTransactionError(error) {
+  return /HMR transactions cannot be nested/i.test(error instanceof Error ? error.message : String(error))
+}
+
 /** Cordis services the plugin cannot work without. */
 export const inject = ['configEditor', 'credentials', 'timer']
 
@@ -364,6 +369,14 @@ export function apply(ctx, rawConfig) {
     return operation()
   }
 
+  // `configEditor.edit` is rejected whenever `hmr.executing` still holds a
+  // store ("HMR transactions cannot be nested"). exit() clears the store for the
+  // synchronous call and its whole continuation, which covers every trigger this
+  // plugin installs (timers, loader events, the command handler). A rejection can
+  // still happen when a *neighbouring* transaction is live at that instant, so
+  // the write is attempted and, on exactly that error, handed to the throttled
+  // retry below rather than being treated as a permanent failure.
+
   let inFlight = undefined
   let pendingReason = undefined
   let debounceTimer = undefined
@@ -378,7 +391,9 @@ export function apply(ctx, rawConfig) {
     const target = report.kind === 'capability-scan' ? capabilityFile : debugFile
     try {
       mkdirSync(dirname(target), { recursive: true })
-      writeFileSync(target, JSON.stringify(report, null, 2) + '\n', 'utf8')
+      // attemptedWrite is bookkeeping for status classification, not report data.
+      const { attemptedWrite, ...published } = report
+      writeFileSync(target, JSON.stringify(published, null, 2) + '\n', 'utf8')
     } catch (error) {
       console.warn('[gateway-capability-sync] could not write debug report:', error)
     }
@@ -437,8 +452,7 @@ export function apply(ctx, rawConfig) {
 
   function scheduleRetry(reason, error) {
     if (disposed || retriesLeft <= 0) return
-    const message = error instanceof Error ? error.message : String(error)
-    if (!/HMR transactions cannot be nested/i.test(message)) return
+    if (!isNestedTransactionError(error)) return
     retriesLeft -= 1
     if (retryTimer !== undefined) clearTimeout(retryTimer)
     retryTimer = setTimeout(() => {
@@ -465,6 +479,7 @@ export function apply(ctx, rawConfig) {
       providers: [],
       stats: {},
       wrote: false,
+      attemptedWrite: false,
       status: 'failed',
       errors: [],
       durationMs: 0,
@@ -540,6 +555,7 @@ export function apply(ctx, rawConfig) {
 
       const entry = layer.entry
       try {
+        report.attemptedWrite = true
         await ctx.configEditor.edit(entry, (latest) => {
           lifecycle.signal.throwIfAborted()
           const edited = transform(latest, gateways)
@@ -549,6 +565,8 @@ export function apply(ctx, rawConfig) {
           return edited.next
         })
         report.status = report.wrote ? 'updated' : 'skipped'
+        // A write proves the profile is reachable again; restore the retry budget
+        // so a later independent failure is not punished by an earlier one.
         retriesLeft = MAX_RETRIES
         if (retryTimer !== undefined) {
           clearTimeout(retryTimer)
@@ -569,7 +587,10 @@ export function apply(ctx, rawConfig) {
       }
     } finally {
       if (report.status !== 'cancelled' && (report.errors.length > 0 || report.providers.some((provider) => provider.error !== undefined))) {
-        report.status = report.wrote ? 'partial' : 'failed'
+        // An unreachable provider is not a failure of this run when the profile
+        // was updated for the providers that did answer. It is a failure when
+        // nothing could be written at all.
+        report.status = report.wrote ? 'partial' : (report.attemptedWrite ? 'failed' : report.status)
       }
       report.durationMs = Date.now() - startedAt
       writeDebug(report)

@@ -19,6 +19,14 @@ const deferred = () => {
   return { promise, resolve }
 }
 
+/**
+ * Drain pending promise/macrotask work when a test fakes the timer APIs.
+ * The plugin yields with setImmediate for exactly this reason.
+ */
+const settle = async (rounds = 20) => {
+  for (let index = 0; index < rounds; index++) await new Promise(resolve => setImmediate(resolve))
+}
+
 function host(t, { current = configuration(), inherited = {}, entries, config = {}, fetch = async () => response(), beforeEdit, credentials, llm, emitOnEdit = false, hmr } = {}) {
   let command
   let edits = 0
@@ -415,6 +423,76 @@ test('leaves an actual AsyncLocalStorage HMR transaction before editing', async 
     assert.equal(executing.getStore(), 'activation-transaction')
   })
   assert.equal(h.edits, 1)
+})
+
+test('a run never edits while an HMR transaction is live', async t => {
+  const executing = new AsyncLocalStorage()
+  let sawStore = false
+  const h = host(t, {
+    hmr: { executing },
+    beforeEdit: async () => {
+      // The edit must be attempted with a cleared async context.
+      if (executing.getStore() !== undefined) sawStore = true
+    },
+  })
+  await executing.run('outer-transaction', async () => {
+    assert.equal((await h.run()).kind, 'success')
+  })
+  assert.equal(sawStore, false)
+  assert.equal(h.edits, 1)
+})
+
+test('an unreachable provider does not mark a written run as failed', async t => {
+  // One gateway answers, a second is down: the write happens, so the command
+  // reports success for what it could reach rather than failing outright.
+  const h = host(t, {
+    config: { debug: true },
+    current: {
+      providers: {
+        gateway: provider(),
+        dead: { ...provider(), baseURL: 'http://127.0.0.1:9/v1' },
+      },
+    },
+    fetch: async (url) => {
+      if (String(url).includes('127.0.0.1:9')) throw new Error('fetch failed')
+      return response()
+    },
+  })
+  const result = await h.run()
+  // A partially reachable profile surfaces as an error so the operator notices,
+  // but the reachable provider was still enriched and written.
+  assert.equal(result.kind, 'error')
+  assert.deepEqual(h.current.providers.gateway.models[0].input, ['text', 'image'])
+  assert.equal(h.edits, 1)
+  const published = JSON.parse(readFileSync(h.debugFile, 'utf8'))
+  // The distinction that matters: this is a partial write, not a failed one.
+  assert.equal(published.status, 'partial')
+  assert.equal(published.wrote, true)
+  assert.ok(published.providers.some((entry) => entry.key === 'dead' && entry.error !== undefined))
+})
+
+test('an unreachable provider does not turn an up-to-date run into a failure', async t => {
+  // Nothing needed writing and a second gateway is down. The run did its job,
+  // so it must stay up-to-date instead of being reported as a failure.
+  const h = host(t, {
+    config: { debug: true },
+    current: {
+      providers: {
+        gateway: provider({ models: [{ id: 'm', input: ['text', 'image'], reasoningEfforts: { low: 'low', high: 'high', off: null }, compat: { thinkingFormat: 'deepseek', supportsReasoningEffort: true } }] }),
+        dead: { ...provider(), baseURL: 'http://127.0.0.1:9/v1' },
+      },
+    },
+    fetch: async (url) => {
+      if (String(url).includes('127.0.0.1:9')) throw new Error('fetch failed')
+      return response()
+    },
+  })
+  const result = await h.run()
+  assert.equal(h.edits, 0)
+  const published = JSON.parse(readFileSync(h.debugFile, 'utf8'))
+  assert.equal(published.wrote, false)
+  assert.equal(published.status, 'up-to-date')
+  assert.equal(result.kind, 'success')
 })
 
 test('rejects invalid thinking formats before scheduling any work', t => {
