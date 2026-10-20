@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Gateway Capability Sync",
+    "description": "Reads vision, reasoning-effort and thinking-disable capabilities from your OpenAI-compatible gateway's /v1/models and writes them into the Harness pi-ai provider config, preserving manual overrides."
+  }
+}

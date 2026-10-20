@@ -1,0 +1,47 @@
+{
+  "name": "dsh-gateway-capability-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Reads vision / reasoning-effort / thinking-disable capabilities from an OpenAI-compatible gateway's /v1/models and writes them into the Harness pi-ai provider config.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "gateway",
+    "pi-ai"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luckykong/dsh-gateway-capability-sync.git"
+  },
+  "homepage": "https://github.com/luckykong/dsh-gateway-capability-sync#readme",
+  "bugs": {
+    "url": "https://github.com/luckykong/dsh-gateway-capability-sync/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=0.2.1-0 <0.3.0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

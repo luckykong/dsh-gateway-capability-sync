@@ -1,0 +1,19 @@
+# Gateway capability sync: one Host row.
+#
+# The row config is unvalidated by design (the plugin exports no Config schema),
+# so every field is optional and unknown fields are ignored. See README.md for
+# the meaning of each option.
+- insert:
+    - id: gateway-capability-sync
+      name: 'dsh-gateway-capability-sync'
+      config:
+        entryId: llm-pi-ai
+        providers: []
+        syncOnStart: true
+        syncOnConfigReload: true
+        syncImages: true
+        syncReasoning: true
+        thinkingFormat: deepseek
+        overwrite: missing
+        debug: true
+        debugFile: ''

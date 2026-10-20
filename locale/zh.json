@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "网关模型能力同步",
+    "description": "从 OpenAI 兼容网关的 /v1/models 读取图片输入、思考档位与“可关闭思考”能力，写回 Harness 的 pi-ai 模型配置，并保留手工覆盖的设置。"
+  }
+}

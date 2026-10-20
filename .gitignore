@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Runtime reports produced by the plugin itself
+sync-debug.json
+sync-capabilities.json
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.log
+
+# Local scratch
+*.local.*
